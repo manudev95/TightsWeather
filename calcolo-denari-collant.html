@@ -1,0 +1,156 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Che denari oggi?</title>
+<style>
+:root{--bg:#eef0f6;--ink:#1d2140;--mute:#5d6285;--card:#fff;--line:#c9cde0;--acc:#5b2f91;--acc-ink:#fff}
+@media (prefers-color-scheme:dark){:root{--bg:#14162a;--ink:#e9eaf6;--mute:#9a9fc4;--card:#1d2040;--line:#363a63;--acc:#b79af0;--acc-ink:#14162a}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 Georgia,"Times New Roman",serif;display:grid;place-items:start center;min-height:100vh;padding:24px 16px}
+main{width:100%;max-width:440px}
+h1{font-size:28px;margin:0 0 4px;font-weight:600;letter-spacing:-.01em}
+p.sub{margin:0 0 20px;color:var(--mute)}
+label{display:block;font-size:14px;color:var(--mute);margin:14px 0 4px}
+input,select,button{font:inherit;width:100%;padding:11px 12px;border-radius:8px;border:1px solid var(--line);background:var(--card);color:var(--ink)}
+button{margin-top:18px;background:var(--acc);color:var(--acc-ink);border:0;font-weight:600;cursor:pointer}
+button:disabled{opacity:.6;cursor:wait}
+:focus-visible{outline:3px solid var(--acc);outline-offset:2px}
+#out{margin-top:24px}
+.res{display:flex;gap:16px;align-items:center;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:16px}
+.swatch{flex:none;width:96px;height:96px}
+.swatch img{display:block;width:100%;height:100%;object-fit:contain}
+@media (prefers-color-scheme:dark){.swatch img{filter:invert(1)}}
+.den{font-size:34px;font-weight:600;line-height:1.1}
+.peso{color:var(--mute)}
+.meteo{margin:14px 2px 0;color:var(--mute);font-size:14px}
+.err{color:#b3261e;margin-top:16px}
+@media (prefers-color-scheme:dark){.err{color:#ff9d94}}
+</style>
+</head>
+<body>
+<main>
+  <h1>Quali collant metto oggi?</h1>
+  <p class="sub">Scrivi dove sei e ti consiglio che collant mettere.</p>
+
+  <label for="luogo">Località</label>
+  <input id="luogo" placeholder="es. Milano" autocomplete="off">
+
+  <label for="sens">Quanto soffri il freddo?</label>
+  <select id="sens">
+    <option value="molto">Molto</option>
+    <option value="media">Media</option>
+    <option value="normale" selected>Normale</option>
+    <option value="poco">Poco</option>
+  </select>
+
+  <label for="capo">Cosa indossi?</label>
+  <select id="capo">
+    <option value="corta">Gonna / vestito corto</option>
+    <option value="lunga" selected>Gonna / vestito al ginocchio o lungo</option>
+    <option value="pantaloni">Pantaloni</option>
+  </select>
+
+  <button id="vai">Calcola</button>
+  <div id="out" aria-live="polite"></div>
+</main>
+
+<script>
+/* ========= LOGICA (pura, riusabile identica in Node / bot Telegram) ========= */
+
+// Open-Meteo: nessuna chiave API, CORS abilitato
+async function geocodifica(nome){
+  const u = "https://geocoding-api.open-meteo.com/v1/search?count=1&language=it&format=json&name=" + encodeURIComponent(nome);
+  const r = await fetch(u); if(!r.ok) throw new Error("Servizio geocoding non raggiungibile");
+  const d = await r.json();
+  if(!d.results || !d.results.length) throw new Error("Località non trovata: controlla il nome.");
+  const p = d.results[0];
+  return { lat:p.latitude, lon:p.longitude, nome:[p.name,p.admin1,p.country_code].filter(Boolean).join(", ") };
+}
+
+async function meteoOggi(lat, lon){
+  const u = "https://api.open-meteo.com/v1/forecast?latitude="+lat+"&longitude="+lon+
+    "&daily=temperature_2m_max,temperature_2m_min,wind_speed_10m_max&hourly=relative_humidity_2m"+
+    "&wind_speed_unit=kmh&timezone=auto&forecast_days=1";
+  const r = await fetch(u); if(!r.ok) throw new Error("Servizio meteo non raggiungibile");
+  const d = await r.json();
+  const h = d.hourly.relative_humidity_2m.filter(v => v != null);
+  return {
+    tmax: d.daily.temperature_2m_max[0],
+    tmin: d.daily.temperature_2m_min[0],
+    vento: d.daily.wind_speed_10m_max[0],                    // km/h
+    umidita: h.reduce((a,b)=>a+b,0) / h.length               // media giornaliera %
+  };
+}
+
+// Spostamento in °C della temperatura "sentita" in base alla sensibilità
+const OFFSET_SENS = { molto:-3, media:-1.5, normale:0, poco:2 };
+
+// Cosa si indossa sopra la calza: off = spostamento °C, vento/umid = moltiplicatori delle penalità
+const CAPO = {
+  corta:     { off:-2.5, vento:1.5, umid:1    },  // gonna/vestito sopra il ginocchio
+  lunga:     { off: 0,   vento:1,   umid:1    },  // gonna/vestito dal ginocchio in giù (riferimento)
+  pantaloni: { off: 6,   vento:0,   umid:0.25 }   // la calza fa solo da strato di base
+};
+
+// Soglie sulla temperatura percepita (dalla più calda alla più fredda)
+const FASCE = [
+  { da:22,  den:"Senza calze",                peso:"nessuna",              o:0    },
+  { da:19,  den:"Senza calze, oppure 10–15",  peso:"velo leggerissimo",    o:.10  },
+  { da:16,  den:"20",                         peso:"leggera",              o:.22  },
+  { da:12,  den:"30–40",                      peso:"media, semi-coprente", o:.38  },
+  { da:8,   den:"50–60",                      peso:"coprente",             o:.55  },
+  { da:4,   den:"70–80",                      peso:"opaca, calda",         o:.72  },
+  { da:0,   den:"100–120",                    peso:"pesante",              o:.88  },
+  { da:-99, den:"150+ (lana o felpata)",      peso:"molto pesante",        o:1    }
+];
+
+function calcolaDenari({ tmax, tmin, vento, umidita, sensibilita, capo }){
+  const c = CAPO[capo] ?? CAPO.lunga;
+  // La mattina/sera (minima) pesa più del picco pomeridiano
+  let sentita = 0.4*tmax + 0.6*tmin;
+  // Vento: oltre ~8 km/h raffredda
+  sentita -= Math.max(0, vento - 8) * 0.12 * c.vento;
+  // Umidità alta con fresco: freddo che entra nelle ossa
+  if (sentita < 20 && umidita > 65) sentita -= (umidita - 65) / 35 * 1.5 * c.umid;
+  // Sensibilità personale
+  sentita += OFFSET_SENS[sensibilita] ?? 0;
+  // Capo indossato
+  sentita += c.off;
+
+  const fascia = FASCE.find(f => sentita >= f.da);
+  return { ...fascia, sentita: Math.round(sentita*10)/10 };
+}
+
+/* ========= INTERFACCIA (da sostituire con i messaggi del bot se serve) ========= */
+const $ = id => document.getElementById(id);
+
+
+async function esegui(){
+  const luogo = $("luogo").value.trim();
+  const out = $("out");
+  if(!luogo){ out.innerHTML = '<p class="err">Inserisci una località.</p>'; return; }
+  $("vai").disabled = true; out.textContent = "Controllo il meteo…";
+  try{
+    const pos = await geocodifica(luogo);
+    const m = await meteoOggi(pos.lat, pos.lon);
+    const r = calcolaDenari({ ...m, sensibilita: $("sens").value, capo: $("capo").value });
+    out.innerHTML =
+      '<div class="res"><div class="swatch"><img alt="Gambe" src="https://static.thenounproject.com/png/880780-200.png" style="opacity:'+(0.12+0.88*r.o)+'"></div><div>'+
+      '<div class="den">'+r.den+(/^\d/.test(r.den)?' den':'')+'</div>'+
+      '<div class="peso">'+r.peso+'</div></div></div>'+
+      '<p class="meteo">'+pos.nome+' oggi: '+Math.round(m.tmin)+'°–'+Math.round(m.tmax)+'°, vento '+
+      Math.round(m.vento)+' km/h, umidità '+Math.round(m.umidita)+'%. Temperatura percepita per te: '+r.sentita+'°.</p>';
+  }catch(e){
+    const bloccata = e instanceof TypeError; // fetch bloccata: rete, anteprima sandbox, adblock
+    out.innerHTML = '<p class="err">'+(bloccata
+      ? 'Non riesco a contattare Open-Meteo. Apri il file direttamente nel browser (doppio clic su denari.html), controlla la connessione e disattiva eventuali adblock per questa pagina.'
+      : e.message)+'</p>';
+  }finally{ $("vai").disabled = false; }
+}
+$("vai").addEventListener("click", esegui);
+$("luogo").addEventListener("keydown", e => { if(e.key==="Enter") esegui(); });
+</script>
+</body>
+</html>
